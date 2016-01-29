@@ -86,6 +86,9 @@ def find_zone_id_for_domain(route53_client, domain):
             # This assumes that zones are returned sorted by specificity,
             # meaning in the following order:
             # ["foo.bar.baz.com", "bar.baz.com", "baz.com", "com"]
+            if zone['Config']['PrivateZone']:
+                # ignore private zones
+                continue
             if (
                 domain.endswith(zone["Name"]) or
                 (domain + ".").endswith(zone["Name"])
@@ -133,17 +136,23 @@ def generate_certificate_name(hosts, cert):
     )
 
 
-def get_load_balancer_certificate(elb_client, elb_name, elb_port):
+def get_load_balancer_listener(elb_client, elb_name, elb_port):
     response = elb_client.describe_load_balancers(
         LoadBalancerNames=[elb_name]
     )
     [description] = response["LoadBalancerDescriptions"]
-    [certificate_id] = [
-        listener["Listener"]["SSLCertificateId"]
+    return next((
+        listener["Listener"]
         for listener in description["ListenerDescriptions"]
         if listener["Listener"]["LoadBalancerPort"] == elb_port
-    ]
-    return certificate_id
+    ), None)
+
+
+def get_load_balancer_certificate(elb_client, elb_name, elb_port):
+    listener = get_load_balancer_listener(elb_client, elb_name, elb_port)
+    if listener:
+        return listener["SSLCertificateId"]
+    return None
 
 
 def get_expiration_date_for_certificate(iam_client, ssl_certificate_arn):
@@ -177,7 +186,8 @@ def start_dns_challenge(logger, acme_client, elb_client, route53_client,
 
     zone_id = find_zone_id_for_domain(route53_client, host)
     logger.emit(
-        "updating-elb.create-txt-record", elb_name=elb_name, host=host
+        "updating-elb.create-txt-record", elb_name=elb_name, host=host,
+        zone_id=zone_id
     )
     change_id = change_txt_record(
         route53_client,
@@ -215,7 +225,11 @@ def complete_dns_challenge(logger, acme_client, route53_client, elb_name,
         acme_client.key.public_key()
     )
     if not verified:
-        raise ValueError("Failed verification")
+        # raise ValueError("Failed verification")
+        logger.emit(
+            "updating-elb.failed-local-verification",
+            elb_name=elb_name, host=authz_record.host
+        )
 
     logger.emit(
         "updating-elb.answer-challenge",
@@ -247,7 +261,8 @@ def request_certificate(logger, acme_client, elb_name, authorizations, csr):
 
 def add_certificate_to_elb(logger, elb_client, iam_client, elb_name, elb_port,
                            hosts, private_key, pem_certificate,
-                           pem_certificate_chain):
+                           pem_certificate_chain,
+                           create_listener):
     logger.emit("updating-elb.upload-iam-certificate", elb_name=elb_name)
     response = iam_client.upload_server_certificate(
         ServerCertificateName=generate_certificate_name(
@@ -267,12 +282,32 @@ def add_certificate_to_elb(logger, elb_client, iam_client, elb_name, elb_port,
     # Sleep before trying to set the certificate, it appears to sometimes fail
     # without this.
     time.sleep(15)
-    logger.emit("updating-elb.set-elb-certificate", elb_name=elb_name)
-    elb_client.set_load_balancer_listener_ssl_certificate(
-        LoadBalancerName=elb_name,
-        SSLCertificateId=new_cert_arn,
-        LoadBalancerPort=elb_port,
-    )
+    if create_listener:
+        # try to copy the current http listener if we can
+        http_listener = get_load_balancer_listener(elb_client, elb_name, 80)
+        if http_listener:
+            logger.emit("updating-elb.create-elb-listener", elb_name=elb_name)
+            elb_client.create_load_balancer_listeners(
+                LoadBalancerName=elb_name,
+                Listeners=[
+                    {
+                        'Protocol': 'https',
+                        'LoadBalancerPort': elb_port,
+                        'InstanceProtocol': http_listener['InstanceProtocol'],
+                        'InstancePort': http_listener['InstancePort'],
+                        'SSLCertificateId': new_cert_arn
+                    },
+                ]
+            )
+        else:
+            logger.emit("updating-elb.no-elb-listener", elb_name=elb_name)
+    else:
+        logger.emit("updating-elb.set-elb-certificate", elb_name=elb_name)
+        elb_client.set_load_balancer_listener_ssl_certificate(
+            LoadBalancerName=elb_name,
+            SSLCertificateId=new_cert_arn,
+            LoadBalancerPort=elb_port,
+        )
 
 
 def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
@@ -282,19 +317,24 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
         elb_client, elb_name, elb_port
     )
 
-    expiration_date = get_expiration_date_for_certificate(
-        iam_client, certificate_id
-    ).date()
-    logger.emit(
-        "updating-elb.certificate-expiration",
-        elb_name=elb_name, expiration_date=expiration_date
-    )
-    days_until_expiration = expiration_date - datetime.date.today()
-    if (
-        days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
-        not force_issue
-    ):
-        return
+    create_listener = False
+    if certificate_id:
+        expiration_date = get_expiration_date_for_certificate(
+            iam_client, certificate_id
+        ).date()
+        logger.emit(
+            "updating-elb.certificate-expiration",
+            elb_name=elb_name, expiration_date=expiration_date
+        )
+        days_until_expiration = expiration_date - datetime.date.today()
+        if (
+            days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
+            not force_issue
+        ):
+            return
+    else:
+        # we have to create a listener for this
+        create_listener = True
 
     if key_type == "rsa":
         private_key = generate_rsa_private_key()
@@ -325,7 +365,8 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
             logger,
             elb_client, iam_client,
             elb_name, elb_port, hosts,
-            private_key, pem_certificate, pem_certificate_chain
+            private_key, pem_certificate, pem_certificate_chain,
+            create_listener=create_listener
         )
     finally:
         for authz_record in authorizations:

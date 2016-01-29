@@ -144,7 +144,8 @@ An example IAM policy is:
             "Effect": "Allow",
             "Action": [
                 "elasticloadbalancing:DescribeLoadBalancers",
-                "elasticloadbalancing:SetLoadBalancerListenerSSLCertificate"
+                "elasticloadbalancing:SetLoadBalancerListenerSSLCertificate",
+                "elasticloadbalancing:CreateLoadBalancerListeners"
             ],
             "Resource": [
                 "*"
